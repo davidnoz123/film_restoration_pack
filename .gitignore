@@ -7,12 +7,7 @@
 *.mp3
 
 # ── Generated outputs (fully reproducible by running the pipeline) ─
-outputs/delivery_upscaled/
-outputs/master_native/
-outputs/tests/
-
-# Keep sweep results CSV
-!outputs/sweep/sweep_results.csv
+outputs/
 
 # ── FFmpeg / tool artefacts ───────────────────────────────────────
 _vmaf_tmp.json
