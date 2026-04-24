@@ -31,7 +31,7 @@ def safe_local_imports(g: dict) -> None:
     exception is caught, logged with a full traceback, then re-raised —
     so the log always contains a FATAL line before the process dies.
 
-    Call once near the top of main():
+    Call once at the top of `if __name__ == "__main__":`, before calling main():
         safe_local_imports(globals())
     """
     try:
@@ -44,10 +44,9 @@ def safe_local_imports(g: dict) -> None:
         raise
 
 
-def main() -> int:
+if __name__ == "__main__":
     safe_local_imports(globals())
-    # MyClass etc. are now available as module globals
-    ...
+    main()   # MyClass etc. now available as module globals
 ```
 
 **Scope:**
