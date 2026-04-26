@@ -27,3 +27,6 @@ C
 Thumbs.db
 desktop.ini
 .vscode/
+
+# Agent local overrides (machine-specific, must not be committed)
+AGENTS.local.md
