@@ -14,6 +14,7 @@ Usage:
   python film_restore.py sweep        # step 5 (optional): test many stabilisation candidates + auto-score
   python film_restore.py score        # re-score all files in outputs/sweep/ without re-rendering
   python film_restore.py compare      # generate original vs best-candidate side-by-side clip
+  python film_restore.py serve        # launch browser comparison player (requires: pip install flask)
 
 Recommended order:
   0. Run 'dupcheck' (fast, for clean telecine) OR 'tempseg' (full temporal segmentation,
@@ -29,6 +30,7 @@ Recommended order:
 
 Requires for scoring / dupcheck / tempseg: pip install opencv-python numpy
 Optional for plots:                        pip install matplotlib
+Required for serve (player):               pip install flask uvicorn asgiref
 """
 
 from __future__ import annotations
@@ -138,6 +140,11 @@ DEFLICKER    = "deflicker=size=5"
 TMIX         = "tmix=frames=3"
 DENOISE      = "hqdn3d=3:3:9:9"
 SHARPEN      = "unsharp=5:5:0.8:5:5:0.0"
+# colorbalance: correct aged warm/red cast from dye-layer fading
+#   rs/gs/bs = shadows, rm/gm/bm = midtones, rh/gh/bh = highlights  (range -1..1)
+#   Red reduced in highlights + midtones; blue lifted in highlights + shadows;
+#   green nudged down in shadows to counteract the green-shadow effect.
+COLORBALANCE = "colorbalance=rs=-0.03:gs=-0.03:bs=0.04:rm=-0.04:gm=0:bm=0:rh=-0.06:gh=0:bh=0.08"
 COLOR              = "eq=contrast=1.10:saturation=1.15:brightness=0.01"
 # minterpolate modes:
 #   mi_mode=blend  — fast cross-dissolve; produces ghost frames on fast pans
@@ -156,9 +163,11 @@ DEDUPLICATE  = "mpdecimate=hi=256:lo=128:frac=0.33"
 #   interpolator see the frames.  If flickery frames are fed into minterpolate
 #   the synthesised tween frames inherit the brightness discontinuity.
 #   stabilize SECOND — works on brightness-corrected frames.
+#   colorbalance + eq BEFORE unsharp — sharpen correctly-coloured frames, not
+#   colour-shifted ones.  Sharpening a red-cast frame boosts red edges.
 #   minterpolate LAST — synthesises smooth in-between frames from clean input.
-PIPELINE              = ",".join([DEFLICKER, STABILIZE, TMIX, DENOISE, SHARPEN, COLOR, MINTERPOLATE])
-PIPELINE_WITH_UPSCALE = ",".join([DEFLICKER, STABILIZE, TMIX, DENOISE, SHARPEN, COLOR, MINTERPOLATE, UPSCALE])
+PIPELINE              = ",".join([DEFLICKER, STABILIZE, TMIX, DENOISE, COLORBALANCE, COLOR, SHARPEN, MINTERPOLATE])
+PIPELINE_WITH_UPSCALE = ",".join([DEFLICKER, STABILIZE, TMIX, DENOISE, COLORBALANCE, COLOR, SHARPEN, MINTERPOLATE, UPSCALE])
 
 
 # ── Sweep candidates ──────────────────────────────────────────────────────────
@@ -1276,11 +1285,11 @@ def build_pipeline(
     """Construct a -vf filter chain for a given parameter set.
 
     Pipeline order: [deduplicate] → deflicker → stabilize → [tmix] → denoise
-                    → sharpen → color → [minterpolate] → [upscale]
+                    → colorbalance → color → sharpen → [minterpolate] → [upscale]
 
     deflicker runs BEFORE stabilize and minterpolate so both receive
-    brightness-corrected frames.  Feeding flickery frames into minterpolate
-    causes the synthesised tween frames to inherit the brightness discontinuity.
+    brightness-corrected frames.  colorbalance + eq run BEFORE unsharp so that
+    sharpening is applied to colour-corrected frames, not colour-shifted ones.
     """
     filters = []
     if deduplicate:
@@ -1291,7 +1300,7 @@ def build_pipeline(
     ]
     if tmix:
         filters.append(tmix)
-    filters += [DENOISE, SHARPEN, COLOR]
+    filters += [DENOISE, COLORBALANCE, COLOR, SHARPEN]
     if minterpolate:
         filters.append(minterpolate)
     if upscale:
@@ -1971,6 +1980,239 @@ def step_fftcheck() -> None:
     print(f"\n  Plot saved: {plot_path}")
 
 
+# ── Flask comparison player ────────────────────────────────────────────────────
+
+def step_serve(port: int = 5000) -> None:
+    """Launch a local browser-based side-by-side video comparison player.
+
+    Reads outputs/sweep/sweep_results.csv for candidate list + metrics.
+    Serves outputs/sweep/*.mp4 with byte-range support so seeking works.
+    Opens http://127.0.0.1:<port> in the default browser automatically.
+    """
+    try:
+        from flask import Flask, Response, abort, request as flask_request
+    except ImportError:
+        print("Flask is required for 'serve'. Install it with:  pip install flask")
+        sys.exit(1)
+
+    import queue as _queue
+    import threading
+    import webbrowser
+
+    player_html = Path(__file__).parent / "player" / "index.html"
+    if not player_html.exists():
+        print(f"player/index.html not found at {player_html}")
+        sys.exit(1)
+
+    app = Flask(__name__)
+
+    _sse_subscribers: list = []
+    _sse_lock = threading.Lock()
+
+    def _broadcast(event_type: str, payload: dict) -> None:
+        import json as _json
+        msg = _json.dumps({"type": event_type, **payload})
+        dead = []
+        with _sse_lock:
+            for q in _sse_subscribers:
+                try:
+                    q.put_nowait(msg)
+                except Exception:
+                    dead.append(q)
+            for q in dead:
+                _sse_subscribers.remove(q)
+
+    @app.route("/")
+    def index():
+        return Response(player_html.read_bytes(), mimetype="text/html")
+
+    @app.route("/api/candidates")
+    def api_candidates():
+        import json as _json
+        csv_path = SWEEP_DIR / "sweep_results.csv"
+        if not csv_path.exists():
+            return Response(_json.dumps([]), mimetype="application/json")
+        numeric = {
+            "jitter_mean", "jitter_p95", "flicker_std", "flicker_hf_energy",
+            "sharpness_median", "sharpness_p10", "artifact_score",
+            "brisque_mean", "ssim_mean", "psnr_mean", "vmaf_mean",
+        }
+        # Prepend the unprocessed original as the first option
+        results = [{"label": "original (unprocessed)", "file": "_original.mp4"}]
+        with csv_path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                entry = {}
+                for k, v in row.items():
+                    if k in numeric:
+                        try:
+                            entry[k] = float(v)
+                        except (ValueError, TypeError):
+                            pass  # omit missing / non-numeric
+                    else:
+                        entry[k] = v
+                # expose only the filename, not the full path
+                entry["file"] = Path(entry.get("file", "")).name
+                results.append(entry)
+        return Response(_json.dumps(results), mimetype="application/json")
+
+    @app.route("/videos/<filename>")
+    def serve_video(filename):
+        # Security: reject anything that isn't a plain .mp4 filename
+        if "/" in filename or "\\" in filename or not filename.lower().endswith(".mp4"):
+            abort(400)
+        # Special alias: serve the original unprocessed input
+        if filename == "_original.mp4":
+            video_path = INPUT.resolve()
+        elif flask_request.args.get("dir") == "tests":
+            tests_dir = (Path(__file__).parent / "outputs" / "tests").resolve()
+            video_path = (tests_dir / filename).resolve()
+            try:
+                video_path.relative_to(tests_dir)
+            except ValueError:
+                abort(403)
+        else:
+            video_path = (SWEEP_DIR / filename).resolve()
+            # Ensure the resolved path is still inside SWEEP_DIR (no traversal)
+            try:
+                video_path.relative_to(SWEEP_DIR.resolve())
+            except ValueError:
+                abort(403)
+        if not video_path.exists():
+            abort(404)
+
+        file_size = video_path.stat().st_size
+        range_header = flask_request.headers.get("Range")
+
+        if range_header:
+            # Parse "bytes=start-end"
+            byte_range = range_header.replace("bytes=", "").strip()
+            parts = byte_range.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end   = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+            end   = min(end, file_size - 1)
+            length = end - start + 1
+
+            def _generate():
+                with video_path.open("rb") as fh:
+                    fh.seek(start)
+                    remaining = length
+                    chunk = 65536
+                    while remaining > 0:
+                        data = fh.read(min(chunk, remaining))
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            headers = {
+                "Content-Range":  f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(length),
+                "Content-Type":   "video/mp4",
+            }
+            return Response(_generate(), status=206, headers=headers,
+                            direct_passthrough=True)
+
+        # Full file
+        def _full():
+            with video_path.open("rb") as fh:
+                while True:
+                    data = fh.read(65536)
+                    if not data:
+                        break
+                    yield data
+
+        headers = {
+            "Accept-Ranges":  "bytes",
+            "Content-Length": str(file_size),
+            "Content-Type":   "video/mp4",
+        }
+        return Response(_full(), status=200, headers=headers,
+                        direct_passthrough=True)
+
+    @app.route("/api/events")
+    def api_events():
+        q = _queue.SimpleQueue()
+        with _sse_lock:
+            _sse_subscribers.append(q)
+        def _stream():
+            try:
+                while True:
+                    try:
+                        msg = q.get(timeout=15)
+                        yield f"data: {msg}\n\n".encode()
+                    except _queue.Empty:
+                        yield b": keepalive\n\n"
+            except GeneratorExit:
+                with _sse_lock:
+                    try:
+                        _sse_subscribers.remove(q)
+                    except ValueError:
+                        pass
+        return Response(_stream(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                        direct_passthrough=True)
+
+    @app.route("/api/control", methods=["POST"])
+    def api_control():
+        import json as _json
+        body = flask_request.get_json(force=True, silent=True)
+        if not isinstance(body, dict):
+            abort(400)
+        action = body.get("action")
+        if action not in {"play", "pause", "seek", "loop_on", "loop_off"}:
+            abort(400)
+        payload: dict = {"action": action}
+        if action == "seek":
+            t = body.get("time")
+            if not isinstance(t, (int, float)) or t < 0:
+                abort(400)
+            payload["time"] = float(t)
+        _broadcast("control", payload)
+        return Response(_json.dumps({"ok": True}), mimetype="application/json")
+
+    @app.route("/api/select", methods=["POST"])
+    def api_select():
+        import json as _json
+        body = flask_request.get_json(force=True, silent=True)
+        if not isinstance(body, dict):
+            abort(400)
+        side = body.get("side")
+        if side not in ("left", "right"):
+            abort(400)
+        filename = body.get("file", "")
+        if not filename or "/" in filename or "\\" in filename or not filename.lower().endswith(".mp4"):
+            abort(400)
+        src_dir = body.get("dir", "sweep")
+        if src_dir not in ("sweep", "tests"):
+            abort(400)
+        label = body.get("label", filename.replace(".mp4", ""))
+        _broadcast("select", {"side": side, "file": filename, "dir": src_dir, "label": label})
+        return Response(_json.dumps({"ok": True}), mimetype="application/json")
+
+    url = f"http://127.0.0.1:{port}"
+    print(f"  Starting player at {url}")
+    print("  Press Ctrl+C to stop.")
+    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    try:
+        import asyncio
+        import uvicorn
+        from asgiref.wsgi import WsgiToAsgi
+        # uvicorn explicitly sets WindowsProactorEventLoopPolicy on Windows, which
+        # causes spurious WinError 10054 tracebacks when the browser closes a
+        # byte-range connection.  loop="none" prevents uvicorn from overriding the
+        # policy; we then set SelectorEventLoop ourselves and drive uvicorn via
+        # asyncio.run() so the whole server runs on SelectorEventLoop.
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        cfg = uvicorn.Config(WsgiToAsgi(app), host="127.0.0.1", port=port,
+                             log_level="warning", loop="none")
+        asyncio.run(uvicorn.Server(cfg).serve())
+    except ImportError:
+        print("  (uvicorn/asgiref not found — using Flask dev server; pip install uvicorn asgiref for production)")
+        app.run(host="127.0.0.1", port=port, debug=False)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 STEPS = {
@@ -1984,6 +2226,7 @@ STEPS = {
     "sweep":    step_sweep,
     "score":    step_score,
     "compare":  step_compare,
+    "serve":    step_serve,
 }
 
 
