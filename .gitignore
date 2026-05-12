@@ -30,3 +30,5 @@ desktop.ini
 
 # Agent local overrides (machine-specific, must not be committed)
 AGENTS.local.md
+
+locals.txt
